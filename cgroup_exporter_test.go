@@ -14,9 +14,20 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"log/slog"
+	"math/big"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,40 +37,33 @@ import (
 	"time"
 
 	kingpin "github.com/alecthomas/kingpin/v2"
-	"github.com/go-kit/log"
+	"github.com/prometheus/exporter-toolkit/web"
+	"golang.org/x/crypto/bcrypt"
 )
 
-const (
-	address = "localhost:19306"
-)
+// The cgroup v1 fixtures are generated from fixtures.ttar (see .circleci/config.yml
+// and the release workflow) into ./fixtures, which is git ignored.
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, nil))
+}
 
 func TestMain(m *testing.M) {
-	if _, err := kingpin.CommandLine.Parse([]string{"--config.paths=/user.slice"}); err != nil {
+	// Populates the defaults of all kingpin flags.
+	if _, err := kingpin.CommandLine.Parse([]string{}); err != nil {
+		fmt.Fprintln(os.Stderr, "failed to parse flags:", err)
 		os.Exit(1)
 	}
 	_, filename, _, _ := runtime.Caller(0)
-	dir := filepath.Dir(filename)
-	fixture := filepath.Join(dir, "fixtures")
+	fixture := filepath.Join(filepath.Dir(filename), "fixtures")
+	if _, err := os.Stat(fixture); err != nil {
+		fmt.Fprintln(os.Stderr, "fixtures not found, extract them first with: ./ttar -x -f fixtures.ttar")
+		os.Exit(1)
+	}
 	cgroupRoot = &fixture
-	procFixture := filepath.Join(fixture, "proc")
-	procRoot = &procFixture
 	varTrue := true
 	disableExporterMetrics = &varTrue
-	collectProc = &varTrue
-	w := log.NewSyncWriter(os.Stderr)
-	logger := log.NewLogfmtLogger(w)
-	go func() {
-		http.Handle("/metrics", metricsHandler(logger))
-		err := http.ListenAndServe(address, nil)
-		if err != nil {
-			os.Exit(1)
-		}
-	}()
-	time.Sleep(1 * time.Second)
-
-	exitVal := m.Run()
-
-	os.Exit(exitVal)
+	os.Exit(m.Run())
 }
 
 func TestParseCpuSet(t *testing.T) {
@@ -81,263 +85,445 @@ func TestParseCpuSet(t *testing.T) {
 	} else if !reflect.DeepEqual(cpus, expected) {
 		t.Errorf("Unexpected cpus, expected %v got %v", expected, cpus)
 	}
+	if _, err := parseCpuSet("a-b"); err == nil {
+		t.Errorf("Expected an error for an invalid cpuset")
+	}
 }
 
-func TestGetProcInfo(t *testing.T) {
+func TestGetInfoV1(t *testing.T) {
 	metric := CgroupMetric{}
-	w := log.NewSyncWriter(os.Stderr)
-	logger := log.NewLogfmtLogger(w)
-	getProcInfo([]int{95521, 95525}, &metric, logger)
-	if val, ok := metric.processExec["/bin/bash"]; !ok {
-		t.Errorf("Process /bin/bash not in metrics")
-		return
-	} else {
-		if val != 2 {
-			t.Errorf("Expected 2 /bin/bash processes, got %v", val)
-		}
+	getInfoV1("/slurm/uid_20821/job_10", &metric, testLogger())
+	if !metric.job || metric.uid != 20821 || metric.jobid != "10" || metric.step != "" || metric.task != "" {
+		t.Errorf("Unexpected job info: %+v", metric)
 	}
-	varLen := 6
-	collectProcMaxExec = &varLen
-	getProcInfo([]int{95521, 95525}, &metric, logger)
-	if val, ok := metric.processExec["/bi...ash"]; !ok {
-		t.Errorf("Process /bin/bash not in metrics, found: %v", metric.processExec)
-		return
-	} else {
-		if val != 2 {
-			t.Errorf("Expected 2 /b...sh processes, got %v", val)
-		}
+
+	metric = CgroupMetric{}
+	getInfoV1("/slurm/uid_20821/job_10/step_batch/task_3", &metric, testLogger())
+	if !metric.job || metric.jobid != "10" || metric.step != "batch" || metric.task != "3" {
+		t.Errorf("Unexpected step/task info: %+v", metric)
+	}
+
+	metric = CgroupMetric{}
+	getInfoV1("/user.slice/user-20821.slice", &metric, testLogger())
+	if !metric.userslice || metric.job || metric.uid != 20821 {
+		t.Errorf("Unexpected user slice info: %+v", metric)
 	}
 }
 
-func TestCollectUserSlice(t *testing.T) {
-	varFalse := false
-	collectProc = &varFalse
-	w := log.NewSyncWriter(os.Stderr)
-	logger := log.NewLogfmtLogger(w)
-	exporter := NewExporter([]string{"/user.slice"}, logger)
-	metrics, err := exporter.collect()
+func TestGetInfoV2(t *testing.T) {
+	metric := CgroupMetric{}
+	getInfoV2(*slurmScope+"/job_211", &metric, testLogger())
+	if !metric.job || metric.jobid != "211" || metric.uid != -1 || metric.step != "" {
+		t.Errorf("Unexpected job info: %+v", metric)
+	}
+
+	metric = CgroupMetric{}
+	getInfoV2(*slurmScope+"/job_211/step_batch/user/task_special", &metric, testLogger())
+	if !metric.job || metric.jobid != "211" || metric.step != "batch" || metric.task != "special" {
+		t.Errorf("Unexpected step/task info: %+v", metric)
+	}
+
+	metric = CgroupMetric{}
+	getInfoV2("/not/a/slurm/cgroup", &metric, testLogger())
+	if metric.job || metric.jobid != "" {
+		t.Errorf("Unexpected info for a non-slurm cgroup: %+v", metric)
+	}
+}
+
+func TestGetMetricsV1UserSlice(t *testing.T) {
+	m, err := getMetricsV1(testLogger(), "/user.slice/user-20821.slice")
 	if err != nil {
-		t.Errorf("Unexpected error: %s", err.Error())
-		return
+		t.Fatalf("Unexpected error: %s", err.Error())
 	}
-	if val := len(metrics); val != 1 {
-		t.Errorf("Unexpected number of metrics, got %d expected 1", val)
-		return
+	if m.cpuUser != 0.41 {
+		t.Errorf("Unexpected value for cpuUser, got %v", m.cpuUser)
 	}
-	if val := metrics[0].cpuUser; val != 0.41 {
-		t.Errorf("Unexpected value for cpuUser, got %v", val)
+	if m.cpuSystem != 0.39 {
+		t.Errorf("Unexpected value for cpuSystem, got %v", m.cpuSystem)
 	}
-	if val := metrics[0].cpuSystem; val != 0.39 {
-		t.Errorf("Unexpected value for cpuSystem, got %v", val)
+	if m.cpuTotal != 0.831825022 {
+		t.Errorf("Unexpected value for cpuTotal, got %v", m.cpuTotal)
 	}
-	if val := metrics[0].cpuTotal; val != 0.831825022 {
-		t.Errorf("Unexpected value for cpuTotal, got %v", val)
+	if m.cpus != 0 {
+		t.Errorf("Unexpected value for cpus, got %v", m.cpus)
 	}
-	if val := metrics[0].cpus; val != 0 {
-		t.Errorf("Unexpected value for cpus, got %v", val)
+	if m.memoryRSS != 5378048 {
+		t.Errorf("Unexpected value for memoryRSS, got %v", m.memoryRSS)
 	}
-	if val := metrics[0].memoryRSS; val != 5378048 {
-		t.Errorf("Unexpected value for memoryRSS, got %v", val)
+	if m.memoryCache != 2322432 {
+		t.Errorf("Unexpected value for memoryCache, got %v", m.memoryCache)
 	}
-	if val := metrics[0].memoryCache; val != 2322432 {
-		t.Errorf("Unexpected value for memoryCache, got %v", val)
+	if m.memoryUsed != 8081408 {
+		t.Errorf("Unexpected value for memoryUsed, got %v", m.memoryUsed)
 	}
-	if val := metrics[0].memoryUsed; val != 8081408 {
-		t.Errorf("Unexpected value for memoryUsed, got %v", val)
+	if m.memoryTotal != 68719476736 {
+		t.Errorf("Unexpected value for memoryTotal, got %v", m.memoryTotal)
 	}
-	if val := metrics[0].memoryTotal; val != 68719476736 {
-		t.Errorf("Unexpected value for memoryTotal, got %v", val)
+	if m.memoryFailCount != 0 {
+		t.Errorf("Unexpected value for memoryFailCount, got %v", m.memoryFailCount)
 	}
-	if val := metrics[0].memoryFailCount; val != 0 {
-		t.Errorf("Unexpected value for memoryFailCount, got %v", val)
+	if m.memswUsed != 8081408 {
+		t.Errorf("Unexpected value for memswUsed, got %v", m.memswUsed)
 	}
-	if val := metrics[0].memswUsed; val != 8081408 {
-		t.Errorf("Unexpected value for swapUsed, got %v", val)
+	if m.memswTotal != 9.223372036854772e+18 {
+		t.Errorf("Unexpected value for memswTotal, got %v", m.memswTotal)
 	}
-	if val := metrics[0].memswTotal; val != 9.223372036854772e+18 {
-		t.Errorf("Unexpected value for swapTotal, got %v", val)
+	if m.memswFailCount != 0 {
+		t.Errorf("Unexpected value for memswFailCount, got %v", m.memswFailCount)
 	}
-	if val := metrics[0].memswFailCount; val != 0 {
-		t.Errorf("Unexpected value for swapFailCount, got %v", val)
+	if !m.userslice || m.uid != 20821 {
+		t.Errorf("Unexpected user slice info: userslice=%v uid=%v", m.userslice, m.uid)
 	}
-	if val := metrics[0].uid; val != "20821" {
-		t.Errorf("Unexpected value for uid, got %v", val)
+}
+
+func TestGetMetricsV1Torque(t *testing.T) {
+	m, err := getMetricsV1(testLogger(), "/torque/1182724.batch")
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err.Error())
+	}
+	if m.cpuUser != 153146.31 {
+		t.Errorf("Unexpected value for cpuUser, got %v", m.cpuUser)
+	}
+	if m.cpuSystem != 260.77 {
+		t.Errorf("Unexpected value for cpuSystem, got %v", m.cpuSystem)
+	}
+	if m.cpuTotal != 152995.785583781 {
+		t.Errorf("Unexpected value for cpuTotal, got %v", m.cpuTotal)
+	}
+	if m.cpus != 40 {
+		t.Errorf("Unexpected value for cpus, got %v", m.cpus)
+	}
+	if m.memoryRSS != 82444320768 {
+		t.Errorf("Unexpected value for memoryRSS, got %v", m.memoryRSS)
+	}
+	if m.memoryCache != 109678592 {
+		t.Errorf("Unexpected value for memoryCache, got %v", m.memoryCache)
+	}
+	if m.memoryUsed != 82553999360 {
+		t.Errorf("Unexpected value for memoryUsed, got %v", m.memoryUsed)
+	}
+	if m.memoryTotal != 196755132416 {
+		t.Errorf("Unexpected value for memoryTotal, got %v", m.memoryTotal)
+	}
+	if m.memswUsed != 82553999360 {
+		t.Errorf("Unexpected value for memswUsed, got %v", m.memswUsed)
+	}
+	if m.memswTotal != 196755132416 {
+		t.Errorf("Unexpected value for memswTotal, got %v", m.memswTotal)
 	}
 }
 
 func TestCollectSLURM(t *testing.T) {
-	varTrue := true
-	collectProc = &varTrue
-	varLen := 100
-	collectProcMaxExec = &varLen
-	w := log.NewSyncWriter(os.Stderr)
-	logger := log.NewLogfmtLogger(w)
-	exporter := NewExporter([]string{"/slurm"}, logger)
+	exporter := NewExporter(testLogger(), getMetricsV1)
 	metrics, err := exporter.collect()
 	if err != nil {
-		t.Errorf("Unexpected error: %s", err.Error())
-		return
+		t.Fatalf("Unexpected error: %s", err.Error())
 	}
 	if val := len(metrics); val != 2 {
-		t.Errorf("Unexpected number of metrics, got %d expected 2", val)
-		return
+		t.Fatalf("Unexpected number of metrics, got %d expected 2: %v", val, metrics)
 	}
-	var m CgroupMetric
-	for _, metric := range metrics {
-		if metric.jobid == "10" {
-			m = metric
-		}
+	m, ok := metrics["/slurm/uid_20821/job_10"]
+	if !ok {
+		t.Fatalf("Metrics for job_10 not found, got: %v", metrics)
 	}
-	if m.jobid == "" {
-		t.Errorf("Metrics with jobid=10 not found")
-		return
+	if _, ok := metrics["/slurm/uid_20821/job_11"]; !ok {
+		t.Errorf("Metrics for job_11 not found, got: %v", metrics)
 	}
-	if val := m.cpuUser; val != 0 {
-		t.Errorf("Unexpected value for cpuUser, got %v", val)
+	if m.cpuUser != 0 {
+		t.Errorf("Unexpected value for cpuUser, got %v", m.cpuUser)
 	}
-	if val := m.cpuSystem; val != 0 {
-		t.Errorf("Unexpected value for cpuSystem, got %v", val)
+	if m.cpuSystem != 0 {
+		t.Errorf("Unexpected value for cpuSystem, got %v", m.cpuSystem)
 	}
-	if val := m.cpuTotal; val != 0.007710215 {
-		t.Errorf("Unexpected value for cpuTotal, got %v", val)
+	if m.cpuTotal != 0.007710215 {
+		t.Errorf("Unexpected value for cpuTotal, got %v", m.cpuTotal)
 	}
-	if val := m.cpus; val != 2 {
-		t.Errorf("Unexpected value for cpus, got %v", val)
+	if m.cpus != 2 {
+		t.Errorf("Unexpected value for cpus, got %v", m.cpus)
 	}
-	if val := m.memoryRSS; val != 311296 {
-		t.Errorf("Unexpected value for memoryRSS, got %v", val)
+	if m.memoryRSS != 311296 {
+		t.Errorf("Unexpected value for memoryRSS, got %v", m.memoryRSS)
 	}
-	if val := m.memoryCache; val != 4096 {
-		t.Errorf("Unexpected value for memoryCache, got %v", val)
+	if m.memoryCache != 4096 {
+		t.Errorf("Unexpected value for memoryCache, got %v", m.memoryCache)
 	}
-	if val := m.memoryUsed; val != 356352 {
-		t.Errorf("Unexpected value for memoryUsed, got %v", val)
+	if m.memoryUsed != 356352 {
+		t.Errorf("Unexpected value for memoryUsed, got %v", m.memoryUsed)
 	}
-	if val := m.memoryTotal; val != 2147483648 {
-		t.Errorf("Unexpected value for memoryTotal, got %v", val)
+	if m.memoryTotal != 2147483648 {
+		t.Errorf("Unexpected value for memoryTotal, got %v", m.memoryTotal)
 	}
-	if val := m.memoryFailCount; val != 0 {
-		t.Errorf("Unexpected value for memoryFailCount, got %v", val)
+	if m.memoryFailCount != 0 {
+		t.Errorf("Unexpected value for memoryFailCount, got %v", m.memoryFailCount)
 	}
-	if val := m.memswUsed; val != 356352 {
-		t.Errorf("Unexpected value for swapUsed, got %v", val)
+	if m.memswUsed != 356352 {
+		t.Errorf("Unexpected value for memswUsed, got %v", m.memswUsed)
 	}
-	if val := m.memswTotal; val != 2147483648 {
-		t.Errorf("Unexpected value for swapTotal, got %v", val)
+	if m.memswTotal != 2147483648 {
+		t.Errorf("Unexpected value for memswTotal, got %v", m.memswTotal)
 	}
-	if val := m.memswFailCount; val != 0 {
-		t.Errorf("Unexpected value for swapFailCount, got %v", val)
+	if m.memswFailCount != 0 {
+		t.Errorf("Unexpected value for memswFailCount, got %v", m.memswFailCount)
 	}
-	if val := m.uid; val != "20821" {
-		t.Errorf("Unexpected value for uid, got %v", val)
+	if m.uid != 20821 {
+		t.Errorf("Unexpected value for uid, got %v", m.uid)
 	}
-	if val := m.jobid; val != "10" {
-		t.Errorf("Unexpected value for jobid, got %v", val)
-	}
-	if val, ok := m.processExec["/bin/bash"]; !ok {
-		t.Errorf("processExec does not contain /bin/bash")
-	} else {
-		if val != 2 {
-			t.Errorf("Unexpected 2 values for processExec /bin/bash, got %v", val)
-		}
-	}
-}
-
-func TestCollectTorque(t *testing.T) {
-	varFalse := false
-	collectProc = &varFalse
-	w := log.NewSyncWriter(os.Stderr)
-	logger := log.NewLogfmtLogger(w)
-	exporter := NewExporter([]string{"/torque"}, logger)
-	metrics, err := exporter.collect()
-	if err != nil {
-		t.Errorf("Unexpected error: %s", err.Error())
-		return
-	}
-	if val := len(metrics); val != 1 {
-		t.Errorf("Unexpected number of metrics, got %d expected 1", val)
-		return
-	}
-	if val := metrics[0].cpuUser; val != 153146.31 {
-		t.Errorf("Unexpected value for cpuUser, got %v", val)
-	}
-	if val := metrics[0].cpuSystem; val != 260.77 {
-		t.Errorf("Unexpected value for cpuSystem, got %v", val)
-	}
-	if val := metrics[0].cpuTotal; val != 152995.785583781 {
-		t.Errorf("Unexpected value for cpuTotal, got %v", val)
-	}
-	if val := metrics[0].cpus; val != 40 {
-		t.Errorf("Unexpected value for cpus, got %v", val)
-	}
-	if val := metrics[0].memoryRSS; val != 82444320768 {
-		t.Errorf("Unexpected value for memoryRSS, got %v", val)
-	}
-	if val := metrics[0].memoryCache; val != 109678592 {
-		t.Errorf("Unexpected value for memoryCache, got %v", val)
-	}
-	if val := metrics[0].memoryUsed; val != 82553999360 {
-		t.Errorf("Unexpected value for memoryUsed, got %v", val)
-	}
-	if val := metrics[0].memoryTotal; val != 196755132416 {
-		t.Errorf("Unexpected value for memoryTotal, got %v", val)
-	}
-	if val := metrics[0].memoryFailCount; val != 0 {
-		t.Errorf("Unexpected value for memoryFailCount, got %v", val)
-	}
-	if val := metrics[0].memswUsed; val != 82553999360 {
-		t.Errorf("Unexpected value for swapUsed, got %v", val)
-	}
-	if val := metrics[0].memswTotal; val != 196755132416 {
-		t.Errorf("Unexpected value for swapTotal, got %v", val)
-	}
-	if val := metrics[0].memswFailCount; val != 0 {
-		t.Errorf("Unexpected value for swapFailCount, got %v", val)
-	}
-	if val := metrics[0].uid; val != "" {
-		t.Errorf("Unexpected value for uid, got %v", val)
-	}
-	if val := metrics[0].jobid; val != "1182724" {
-		t.Errorf("Unexpected value for jobid, got %v", val)
+	if m.jobid != "10" {
+		t.Errorf("Unexpected value for jobid, got %v", m.jobid)
 	}
 }
 
 func TestMetricsHandler(t *testing.T) {
-	body, err := queryExporter()
-	if err != nil {
-		t.Fatalf("Unexpected error GET /metrics: %s", err.Error())
+	srv := httptest.NewServer(metricsHandler(false, testLogger()))
+	defer srv.Close()
+	body, status := get(t, http.DefaultClient, srv.URL)
+	if status != http.StatusOK {
+		t.Fatalf("Unexpected status %d, body:\n%s", status, body)
 	}
-	if !strings.Contains(body, "cgroup_memory_used_bytes{cgroup=\"/user.slice/user-20821.slice\"} 8.081408e+06") {
-		t.Errorf("Unexpected value for cgroup_memory_used_bytes")
-	}
-}
-
-func TestMetricsHandlerBadPath(t *testing.T) {
-	cPath := "/dne"
-	configPaths = &cPath
-	body, err := queryExporter()
-	if err != nil {
-		t.Fatalf("Unexpected error GET /metrics: %s", err.Error())
-	}
-	if !strings.Contains(body, "cgroup_exporter_collect_error{cgroup=\"/dne\"} 1") {
-		t.Errorf("Unexpected value for cgroup_memory_used_bytes")
+	for _, want := range []string{
+		`cgroup_memory_used_bytes{jobid="10",step="",task=""} 356352`,
+		`cgroup_cpus{jobid="10",step="",task=""} 2`,
+		`cgroup_uid{jobid="10"} 20821`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("Metric %q not found in:\n%s", want, body)
+		}
 	}
 }
 
-func queryExporter() (string, error) {
-	resp, err := http.Get(fmt.Sprintf("http://%s/metrics", address))
-	if err != nil {
-		return "", err
+func TestMetricsHandlerBadRoot(t *testing.T) {
+	bad := filepath.Join(t.TempDir(), "dne")
+	old := cgroupRoot
+	cgroupRoot = &bad
+	defer func() { cgroupRoot = old }()
+	srv := httptest.NewServer(metricsHandler(false, testLogger()))
+	defer srv.Close()
+	body, status := get(t, http.DefaultClient, srv.URL)
+	if status != http.StatusOK {
+		t.Fatalf("Unexpected status %d, body:\n%s", status, body)
 	}
+	if strings.Contains(body, "cgroup_memory_used_bytes") {
+		t.Errorf("Did not expect any cgroup metrics for a missing cgroup root, got:\n%s", body)
+	}
+}
+
+// startWebServer serves the metrics handler through the exporter-toolkit, the
+// same way main() does, and returns the base address. It listens on a free port.
+func startWebServer(t *testing.T, configFile string) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %s", err)
+	}
+	addr := l.Addr().String()
+	noSystemd := false
+	flags := &web.FlagConfig{
+		WebListenAddresses: &[]string{addr},
+		WebSystemdSocket:   &noSystemd,
+		WebConfigFile:      &configFile,
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metricsHandler(false, testLogger()))
+	server := &http.Server{Handler: mux}
+	go func() { _ = web.Serve(l, server, flags, testLogger()) }()
+	t.Cleanup(func() { _ = server.Close() })
+	return addr
+}
+
+func get(t *testing.T, client *http.Client, url string) (string, int) {
+	t.Helper()
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s failed: %s", url, err)
+	}
+	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		t.Fatalf("Reading body failed: %s", err)
 	}
-	if err := resp.Body.Close(); err != nil {
-		return "", err
+	return string(b), resp.StatusCode
+}
+
+func getAuth(t *testing.T, client *http.Client, url, user, pass string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if want, have := http.StatusOK, resp.StatusCode; want != have {
-		return "", fmt.Errorf("want /metrics status code %d, have %d. Body:\n%s", want, have, b)
+	if user != "" {
+		req.SetBasicAuth(user, pass)
 	}
-	return string(b), nil
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s failed: %s", url, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+func bcryptHash(t *testing.T, password string) string {
+	t.Helper()
+	h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(h)
+}
+
+func TestBasicAuth(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "web.yml")
+	content := "basic_auth_users:\n  prometheus: " + bcryptHash(t, "secret") + "\n"
+	if err := os.WriteFile(cfg, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	url := "http://" + startWebServer(t, cfg) + "/metrics"
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	if got := getAuth(t, client, url, "", ""); got != http.StatusUnauthorized {
+		t.Errorf("No credentials: expected 401, got %d", got)
+	}
+	if got := getAuth(t, client, url, "prometheus", "wrong"); got != http.StatusUnauthorized {
+		t.Errorf("Wrong password: expected 401, got %d", got)
+	}
+	if got := getAuth(t, client, url, "prometheus", "secret"); got != http.StatusOK {
+		t.Errorf("Valid credentials: expected 200, got %d", got)
+	}
+}
+
+// testCert creates a certificate signed by parent (or self signed when parent is nil).
+func testCert(t *testing.T, tmpl, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (*x509.Certificate, *ecdsa.PrivateKey, []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parent == nil {
+		parent, parentKey = tmpl, key
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert, key, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func testTemplate(serial int64, cn string, ca bool, usage x509.ExtKeyUsage) *x509.Certificate {
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	if ca {
+		tmpl.IsCA = true
+		tmpl.KeyUsage |= x509.KeyUsageCertSign
+	} else {
+		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{usage}
+		tmpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
+	}
+	return tmpl
+}
+
+func keyPEM(t *testing.T, key *ecdsa.PrivateKey) []byte {
+	t.Helper()
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+}
+
+// TestMutualTLSAndBasicAuth checks the full setup: the server presents a certificate
+// the client verifies, the client has to present a certificate signed by the
+// configured CA, and valid basic auth credentials are still required.
+func TestMutualTLSAndBasicAuth(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, data []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	ca, caKey, caPEM := testCert(t, testTemplate(1, "test ca", true, 0), nil, nil)
+	_, srvKey, srvPEM := testCert(t, testTemplate(2, "server", false, x509.ExtKeyUsageServerAuth), ca, caKey)
+	_, cliKey, cliPEM := testCert(t, testTemplate(3, "client", false, x509.ExtKeyUsageClientAuth), ca, caKey)
+	// A client certificate signed by a CA the server does not trust.
+	otherCA, otherCAKey, _ := testCert(t, testTemplate(4, "other ca", true, 0), nil, nil)
+	_, badKey, badPEM := testCert(t, testTemplate(5, "rogue client", false, x509.ExtKeyUsageClientAuth), otherCA, otherCAKey)
+
+	cfg := write("web.yml", []byte(fmt.Sprintf(`tls_server_config:
+  cert_file: %s
+  key_file: %s
+  client_auth_type: RequireAndVerifyClientCert
+  client_ca_file: %s
+  min_version: TLS12
+basic_auth_users:
+  prometheus: %s
+`, write("server.crt", srvPEM), write("server.key", keyPEM(t, srvKey)), write("ca.crt", caPEM), bcryptHash(t, "secret"))))
+	url := "https://" + startWebServer(t, cfg) + "/metrics"
+
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	clientFor := func(certs ...tls.Certificate) *http.Client {
+		return &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				DisableKeepAlives: true,
+				TLSClientConfig:   &tls.Config{RootCAs: roots, Certificates: certs, MinVersion: tls.VersionTLS12},
+			},
+		}
+	}
+	goodCert, err := tls.X509KeyPair(cliPEM, keyPEM(t, cliKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rogueCert, err := tls.X509KeyPair(badPEM, keyPEM(t, badKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The client does not trust the server: the client has to fail.
+	untrusting := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		DisableKeepAlives: true,
+		TLSClientConfig:   &tls.Config{Certificates: []tls.Certificate{goodCert}, MinVersion: tls.VersionTLS12},
+	}}
+	if _, err := untrusting.Get(url); err == nil {
+		t.Errorf("Expected a failure when the client does not trust the server certificate")
+	}
+	// Plain HTTP must not work against a TLS server.
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(strings.Replace(url, "https://", "http://", 1))
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			t.Errorf("Plain HTTP request unexpectedly succeeded")
+		}
+	}
+	// No client certificate: the handshake has to fail, whatever the credentials are.
+	if _, err := clientFor().Get(url); err == nil {
+		t.Errorf("Expected a TLS failure without a client certificate")
+	}
+	// Client certificate from an untrusted CA.
+	if _, err := clientFor(rogueCert).Get(url); err == nil {
+		t.Errorf("Expected a TLS failure with a client certificate from an untrusted CA")
+	}
+	// Valid certificate, but wrong or missing credentials.
+	if got := getAuth(t, clientFor(goodCert), url, "", ""); got != http.StatusUnauthorized {
+		t.Errorf("Valid certificate, no credentials: expected 401, got %d", got)
+	}
+	if got := getAuth(t, clientFor(goodCert), url, "prometheus", "wrong"); got != http.StatusUnauthorized {
+		t.Errorf("Valid certificate, wrong password: expected 401, got %d", got)
+	}
+	// Everything valid.
+	if got := getAuth(t, clientFor(goodCert), url, "prometheus", "secret"); got != http.StatusOK {
+		t.Errorf("Valid certificate and credentials: expected 200, got %d", got)
+	}
 }
