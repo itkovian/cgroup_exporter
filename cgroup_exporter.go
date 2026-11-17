@@ -35,6 +35,8 @@ import (
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
+	"github.com/prometheus/exporter-toolkit/web"
+	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 	"golang.org/x/sys/unix"
 )
 
@@ -46,7 +48,7 @@ var (
 	defCgroupRoot          = "/sys/fs/cgroup"
 	defSlurmScope          = "/system.slice/slurmstepd.scope"
 	defSlurmOneScope       = "/slurm"
-	listenAddress          = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9306").String()
+	webConfig              = webflag.AddFlags(kingpin.CommandLine, ":9306")
 	disableExporterMetrics = kingpin.Flag("web.disable-exporter-metrics", "Exclude metrics about the exporter (promhttp_*, process_*, go_*)").Default("false").Bool()
 	cgroupRoot             = kingpin.Flag("path.cgroup.root", "Root path to cgroup fs").Default(defCgroupRoot).String()
 	slurmOneScope          = kingpin.Flag("path.slurm.scope", "Relative path to slurm cgroupv1 subdir").Default(defSlurmOneScope).String()
@@ -666,9 +668,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	level.Info(logger).Log("msg", "Starting Server", "address", *listenAddress)
+	level.Info(logger).Log("msg", "Starting Server", "addresses", strings.Join(*webConfig.WebListenAddresses, ","))
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		//nolint:errcheck
 		w.Write([]byte(`<html>
              <head><title>cgroup Exporter</title></head>
@@ -678,9 +681,9 @@ func main() {
              </body>
              </html>`))
 	})
-	http.Handle(metricsEndpoint, metricsHandler(cgroupV2, logger))
-	err := http.ListenAndServe(*listenAddress, nil)
-	if err != nil {
+	mux.Handle(metricsEndpoint, metricsHandler(cgroupV2, logger))
+	server := &http.Server{Handler: mux}
+	if err := web.ListenAndServe(server, webConfig, logger); err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
 	}
