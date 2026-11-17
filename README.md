@@ -63,7 +63,8 @@ Passwords are stored as bcrypt hashes, which can be generated with `htpasswd -nB
 
 Notes:
 
-- `client_auth_type` defaults to `NoClientCert`, so `client_ca_file` has no effect unless `client_auth_type` is set.
+- `client_auth_type` defaults to `NoClientCert`. Setting `client_ca_file` without a `client_auth_type` is rejected at startup.
+- Every certificate the exporter needs to present must be in `cert_file`: the leaf first, followed by any intermediates. The CA in `client_ca_file` only needs to be the one that signs (or is the root of) the Prometheus client certificate, and Prometheus has to send its intermediates as part of `cert_file`.
 - The server certificate needs the `serverAuth` extended key usage and a SAN matching the name Prometheus scrapes. The client certificate needs `clientAuth`.
 - A client without a valid certificate fails the TLS handshake. A client with a valid certificate but a wrong password gets a `401`.
 

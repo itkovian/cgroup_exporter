@@ -14,9 +14,11 @@
 package main
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -391,17 +393,30 @@ func TestBasicAuth(t *testing.T) {
 	}
 }
 
-// testCert creates a certificate signed by parent (or self signed when parent is nil).
-func testCert(t *testing.T, tmpl, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (*x509.Certificate, *ecdsa.PrivateKey, []byte) {
+// testIdentity is a certificate together with its private key.
+type testIdentity struct {
+	cert *x509.Certificate
+	key  crypto.Signer
+}
+
+// newIdentity creates a certificate signed by issuer, or self signed when issuer is nil.
+func newIdentity(t *testing.T, tmpl *x509.Certificate, issuer *testIdentity, useRSA bool) *testIdentity {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	var key crypto.Signer
+	var err error
+	if useRSA {
+		key, err = rsa.GenerateKey(rand.Reader, 2048)
+	} else {
+		key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parent == nil {
-		parent, parentKey = tmpl, key
+	parent, signer := tmpl, key
+	if issuer != nil {
+		parent, signer = issuer.cert, issuer.key
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, key.Public(), signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,41 +424,67 @@ func testCert(t *testing.T, tmpl, parent *x509.Certificate, parentKey *ecdsa.Pri
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cert, key, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	return &testIdentity{cert: cert, key: key}
 }
 
-func testTemplate(serial int64, cn string, ca bool, usage x509.ExtKeyUsage) *x509.Certificate {
-	tmpl := &x509.Certificate{
+func pemChain(ids ...*testIdentity) []byte {
+	var out []byte
+	for _, id := range ids {
+		out = append(out, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: id.cert.Raw})...)
+	}
+	return out
+}
+
+func (id *testIdentity) keyPEM(t *testing.T) []byte {
+	t.Helper()
+	der, err := x509.MarshalPKCS8PrivateKey(id.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+}
+
+// tlsCert returns the identity as a client certificate, presenting the given chain after it.
+func (id *testIdentity) tlsCert(t *testing.T, chain ...*testIdentity) tls.Certificate {
+	t.Helper()
+	c, err := tls.X509KeyPair(pemChain(append([]*testIdentity{id}, chain...)...), id.keyPEM(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func caTemplate(serial int64, cn string) *x509.Certificate {
+	return &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+}
+
+func leafTemplate(serial int64, cn string, usage x509.ExtKeyUsage) *x509.Certificate {
+	return &x509.Certificate{
 		SerialNumber:          big.NewInt(serial),
 		Subject:               pkix.Name{CommonName: cn},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{usage},
 		BasicConstraintsValid: true,
+		DNSNames:              []string{"exporter.test"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
 	}
-	if ca {
-		tmpl.IsCA = true
-		tmpl.KeyUsage |= x509.KeyUsageCertSign
-	} else {
-		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{usage}
-		tmpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
-	}
-	return tmpl
 }
 
-func keyPEM(t *testing.T, key *ecdsa.PrivateKey) []byte {
+// serveTLS starts the exporter with a web config requiring TLS, a client certificate
+// signed by the CA(s) in clientCAPEM, and basic auth (prometheus/secret). The
+// certificates and keys are passed as PEM files, as in a real deployment.
+func serveTLS(t *testing.T, certPEM, keyPEM, clientCAPEM []byte) string {
 	t.Helper()
-	der, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
-}
-
-// TestMutualTLSAndBasicAuth checks the full setup: the server presents a certificate
-// the client verifies, the client has to present a certificate signed by the
-// configured CA, and valid basic auth credentials are still required.
-func TestMutualTLSAndBasicAuth(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name string, data []byte) string {
 		p := filepath.Join(dir, name)
@@ -452,14 +493,6 @@ func TestMutualTLSAndBasicAuth(t *testing.T) {
 		}
 		return p
 	}
-
-	ca, caKey, caPEM := testCert(t, testTemplate(1, "test ca", true, 0), nil, nil)
-	_, srvKey, srvPEM := testCert(t, testTemplate(2, "server", false, x509.ExtKeyUsageServerAuth), ca, caKey)
-	_, cliKey, cliPEM := testCert(t, testTemplate(3, "client", false, x509.ExtKeyUsageClientAuth), ca, caKey)
-	// A client certificate signed by a CA the server does not trust.
-	otherCA, otherCAKey, _ := testCert(t, testTemplate(4, "other ca", true, 0), nil, nil)
-	_, badKey, badPEM := testCert(t, testTemplate(5, "rogue client", false, x509.ExtKeyUsageClientAuth), otherCA, otherCAKey)
-
 	cfg := write("web.yml", []byte(fmt.Sprintf(`tls_server_config:
   cert_file: %s
   key_file: %s
@@ -468,62 +501,191 @@ func TestMutualTLSAndBasicAuth(t *testing.T) {
   min_version: TLS12
 basic_auth_users:
   prometheus: %s
-`, write("server.crt", srvPEM), write("server.key", keyPEM(t, srvKey)), write("ca.crt", caPEM), bcryptHash(t, "secret"))))
-	url := "https://" + startWebServer(t, cfg) + "/metrics"
+`, write("server.crt", certPEM), write("server.key", keyPEM), write("ca.crt", clientCAPEM), bcryptHash(t, "secret"))))
+	return "https://" + startWebServer(t, cfg) + "/metrics"
+}
 
-	roots := x509.NewCertPool()
-	roots.AddCert(ca)
-	clientFor := func(certs ...tls.Certificate) *http.Client {
-		return &http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-				DisableKeepAlives: true,
-				TLSClientConfig:   &tls.Config{RootCAs: roots, Certificates: certs, MinVersion: tls.VersionTLS12},
+func tlsClient(roots *x509.CertPool, serverName string, certs ...tls.Certificate) *http.Client {
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			TLSClientConfig: &tls.Config{
+				RootCAs:      roots,
+				ServerName:   serverName,
+				Certificates: certs,
+				MinVersion:   tls.VersionTLS12,
 			},
-		}
+		},
 	}
-	goodCert, err := tls.X509KeyPair(cliPEM, keyPEM(t, cliKey))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rogueCert, err := tls.X509KeyPair(badPEM, keyPEM(t, badKey))
-	if err != nil {
-		t.Fatal(err)
-	}
+}
 
-	// The client does not trust the server: the client has to fail.
-	untrusting := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
-		DisableKeepAlives: true,
-		TLSClientConfig:   &tls.Config{Certificates: []tls.Certificate{goodCert}, MinVersion: tls.VersionTLS12},
-	}}
-	if _, err := untrusting.Get(url); err == nil {
-		t.Errorf("Expected a failure when the client does not trust the server certificate")
+func poolOf(ids ...*testIdentity) *x509.CertPool {
+	p := x509.NewCertPool()
+	for _, id := range ids {
+		p.AddCert(id.cert)
 	}
-	// Plain HTTP must not work against a TLS server.
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(strings.Replace(url, "https://", "http://", 1))
-	if err == nil {
-		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			t.Errorf("Plain HTTP request unexpectedly succeeded")
+	return p
+}
+
+// TestMutualTLSAndBasicAuth checks the full setup with a realistic PKI: root CA ->
+// intermediate CA -> leaf certificates. The server (RSA) presents its full chain,
+// the clients (ECDSA) must present a certificate that chains to the configured CA
+// and the right key usage, and valid basic auth credentials are still required.
+func TestMutualTLSAndBasicAuth(t *testing.T) {
+	root := newIdentity(t, caTemplate(1, "root ca"), nil, false)
+	inter := newIdentity(t, caTemplate(2, "intermediate ca"), root, false)
+	server := newIdentity(t, leafTemplate(3, "server", x509.ExtKeyUsageServerAuth), inter, true)
+	good := newIdentity(t, leafTemplate(4, "client", x509.ExtKeyUsageClientAuth), inter, false)
+
+	expiredTmpl := leafTemplate(5, "expired client", x509.ExtKeyUsageClientAuth)
+	expiredTmpl.NotBefore, expiredTmpl.NotAfter = time.Now().Add(-48*time.Hour), time.Now().Add(-24*time.Hour)
+	expired := newIdentity(t, expiredTmpl, inter, false)
+	wrongUsage := newIdentity(t, leafTemplate(6, "server cert used as client", x509.ExtKeyUsageServerAuth), inter, false)
+	otherRoot := newIdentity(t, caTemplate(7, "other root ca"), nil, false)
+	rogue := newIdentity(t, leafTemplate(8, "rogue client", x509.ExtKeyUsageClientAuth), otherRoot, false)
+
+	// The server sends leaf + intermediate, and trusts clients chaining to the root.
+	url := serveTLS(t, pemChain(server, inter), server.keyPEM(t), pemChain(root))
+	trusting := poolOf(root)
+
+	tests := []struct {
+		name       string
+		client     *http.Client
+		user, pass string
+		url        string
+		wantErr    bool
+		wantStatus int
+	}{
+		{name: "valid certificate chain and credentials", client: tlsClient(trusting, "", good.tlsCert(t, inter)), user: "prometheus", pass: "secret", wantStatus: http.StatusOK},
+		{name: "valid certificate, no credentials", client: tlsClient(trusting, "", good.tlsCert(t, inter)), wantStatus: http.StatusUnauthorized},
+		{name: "valid certificate, wrong password", client: tlsClient(trusting, "", good.tlsCert(t, inter)), user: "prometheus", pass: "wrong", wantStatus: http.StatusUnauthorized},
+		{name: "valid certificate, unknown user", client: tlsClient(trusting, "", good.tlsCert(t, inter)), user: "nobody", pass: "secret", wantStatus: http.StatusUnauthorized},
+		{name: "no client certificate", client: tlsClient(trusting, ""), user: "prometheus", pass: "secret", wantErr: true},
+		{name: "client does not send its intermediate", client: tlsClient(trusting, "", good.tlsCert(t)), user: "prometheus", pass: "secret", wantErr: true},
+		{name: "client certificate from another CA", client: tlsClient(trusting, "", rogue.tlsCert(t)), user: "prometheus", pass: "secret", wantErr: true},
+		{name: "expired client certificate", client: tlsClient(trusting, "", expired.tlsCert(t, inter)), user: "prometheus", pass: "secret", wantErr: true},
+		{name: "client certificate without clientAuth usage", client: tlsClient(trusting, "", wrongUsage.tlsCert(t, inter)), user: "prometheus", pass: "secret", wantErr: true},
+		{name: "client does not trust the server CA", client: tlsClient(poolOf(otherRoot), "", good.tlsCert(t, inter)), user: "prometheus", pass: "secret", wantErr: true},
+		{name: "server name mismatch", client: tlsClient(trusting, "other.example", good.tlsCert(t, inter)), user: "prometheus", pass: "secret", wantErr: true},
+		{name: "server name matches the SAN", client: tlsClient(trusting, "exporter.test", good.tlsCert(t, inter)), user: "prometheus", pass: "secret", wantStatus: http.StatusOK},
+		{name: "plain http", client: &http.Client{Timeout: 5 * time.Second}, url: strings.Replace(url, "https://", "http://", 1), user: "prometheus", pass: "secret", wantStatus: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			target := tc.url
+			if target == "" {
+				target = url
+			}
+			req, err := http.NewRequest(http.MethodGet, target, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.user != "" {
+				req.SetBasicAuth(tc.user, tc.pass)
+			}
+			resp, err := tc.client.Do(req)
+			if tc.wantErr {
+				if err == nil {
+					resp.Body.Close()
+					t.Fatalf("expected the request to fail, got status %d", resp.StatusCode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("expected status %d, got %d", tc.wantStatus, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// If the server only sends its leaf certificate, clients that do not already know the
+// intermediate cannot verify it: the full chain has to be in cert_file.
+func TestServerCertificateChain(t *testing.T) {
+	root := newIdentity(t, caTemplate(1, "root ca"), nil, false)
+	inter := newIdentity(t, caTemplate(2, "intermediate ca"), root, false)
+	server := newIdentity(t, leafTemplate(3, "server", x509.ExtKeyUsageServerAuth), inter, true)
+	client := newIdentity(t, leafTemplate(4, "client", x509.ExtKeyUsageClientAuth), inter, false)
+
+	url := serveTLS(t, pemChain(server), server.keyPEM(t), pemChain(root))
+	if got := getAuth(t, tlsClient(poolOf(root, inter), "", client.tlsCert(t, inter)), url, "prometheus", "secret"); got != http.StatusOK {
+		t.Errorf("client knowing the intermediate: expected 200, got %d", got)
+	}
+	if _, err := tlsClient(poolOf(root), "", client.tlsCert(t, inter)).Get(url); err == nil {
+		t.Errorf("expected a failure when neither the server nor the client provide the intermediate")
+	}
+}
+
+// The exporter has to refuse to start with an unusable TLS configuration instead of
+// silently serving plain HTTP.
+func TestInvalidTLSConfig(t *testing.T) {
+	root := newIdentity(t, caTemplate(1, "root ca"), nil, false)
+	server := newIdentity(t, leafTemplate(2, "server", x509.ExtKeyUsageServerAuth), root, true)
+	other := newIdentity(t, leafTemplate(3, "other", x509.ExtKeyUsageServerAuth), root, true)
+
+	dir := t.TempDir()
+	write := func(name string, data []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
 		}
+		return p
 	}
-	// No client certificate: the handshake has to fail, whatever the credentials are.
-	if _, err := clientFor().Get(url); err == nil {
-		t.Errorf("Expected a TLS failure without a client certificate")
+	crt := write("server.crt", pemChain(server))
+	key := write("server.key", server.keyPEM(t))
+	wrongKey := write("other.key", other.keyPEM(t))
+	ca := write("ca.crt", pemChain(root))
+	garbage := write("garbage.crt", []byte("not a certificate"))
+
+	tests := map[string]string{
+		"key does not match certificate":     fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", crt, wrongKey),
+		"missing certificate file":           fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", filepath.Join(dir, "missing.crt"), key),
+		"missing key file":                   fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", crt, filepath.Join(dir, "missing.key")),
+		"certificate is not PEM":             fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n", garbage, key),
+		"client CA without client_auth_type": fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n  client_ca_file: %s\n", crt, key, ca),
+		"missing client CA file":             fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n  client_auth_type: RequireAndVerifyClientCert\n  client_ca_file: %s\n", crt, key, filepath.Join(dir, "missing-ca.crt")),
+		"unknown client_auth_type":           fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n  client_auth_type: Bogus\n  client_ca_file: %s\n", crt, key, ca),
+		"unknown option":                     fmt.Sprintf("tls_server_config:\n  cert_file: %s\n  key_file: %s\n  no_such_option: 1\n", crt, key),
 	}
-	// Client certificate from an untrusted CA.
-	if _, err := clientFor(rogueCert).Get(url); err == nil {
-		t.Errorf("Expected a TLS failure with a client certificate from an untrusted CA")
+	for name, cfgContent := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := write("web-"+strings.ReplaceAll(name, " ", "-")+".yml", []byte(cfgContent))
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Close()
+			noSystemd := false
+			flags := &web.FlagConfig{WebListenAddresses: &[]string{l.Addr().String()}, WebSystemdSocket: &noSystemd, WebConfigFile: &cfg}
+			server := &http.Server{Handler: http.NewServeMux()}
+			errCh := make(chan error, 1)
+			go func() { errCh <- web.Serve(l, server, flags, testLogger()) }()
+			select {
+			case err := <-errCh:
+				if err == nil {
+					t.Errorf("expected an error")
+				}
+			case <-time.After(5 * time.Second):
+				_ = server.Close()
+				t.Errorf("the server started with an invalid TLS configuration")
+			}
+		})
 	}
-	// Valid certificate, but wrong or missing credentials.
-	if got := getAuth(t, clientFor(goodCert), url, "", ""); got != http.StatusUnauthorized {
-		t.Errorf("Valid certificate, no credentials: expected 401, got %d", got)
-	}
-	if got := getAuth(t, clientFor(goodCert), url, "prometheus", "wrong"); got != http.StatusUnauthorized {
-		t.Errorf("Valid certificate, wrong password: expected 401, got %d", got)
-	}
-	// Everything valid.
-	if got := getAuth(t, clientFor(goodCert), url, "prometheus", "secret"); got != http.StatusOK {
-		t.Errorf("Valid certificate and credentials: expected 200, got %d", got)
+}
+
+// The toolkit does not report a client CA file without any parsable certificate, it
+// ends up with an empty pool. Make sure that fails closed: no client gets in.
+func TestUnparsableClientCAFailsClosed(t *testing.T) {
+	root := newIdentity(t, caTemplate(1, "root ca"), nil, false)
+	server := newIdentity(t, leafTemplate(2, "server", x509.ExtKeyUsageServerAuth), root, true)
+	client := newIdentity(t, leafTemplate(3, "client", x509.ExtKeyUsageClientAuth), root, false)
+
+	url := serveTLS(t, pemChain(server), server.keyPEM(t), []byte("not a certificate"))
+	if _, err := tlsClient(poolOf(root), "", client.tlsCert(t)).Get(url); err == nil {
+		t.Errorf("expected every client to be rejected when the client CA file has no certificates")
 	}
 }
