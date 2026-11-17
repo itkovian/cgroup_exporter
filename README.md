@@ -36,6 +36,54 @@ If you wish to collect process information for a cgroup pass the `--collect.proc
 setcap cap_sys_ptrace=eip /usr/bin/cgroup_exporter
 ```
 
+## TLS and authentication
+
+TLS, mutual TLS and basic authentication are provided by the Prometheus [exporter-toolkit](https://github.com/prometheus/exporter-toolkit/blob/master/docs/web-configuration.md). Enable them by passing a web configuration file:
+
+```
+cgroup_exporter --web.config.file=/etc/cgroup_exporter/web-config.yml
+```
+
+The `--web.listen-address` flag can be repeated to listen on several addresses, and `--web.systemd-socket` is available for systemd socket activation.
+
+[webconfig.example.yaml](webconfig.example.yaml) configures basic authentication over TLS, with both sides verifying each other:
+
+```yaml
+tls_server_config:
+  cert_file: /etc/cgroup_exporter/server.crt      # leaf first, then any intermediates
+  key_file: /etc/cgroup_exporter/server.key
+  client_auth_type: RequireAndVerifyClientCert
+  client_ca_file: /etc/cgroup_exporter/ca.crt     # CA that signed Prometheus's client cert
+  min_version: TLS12
+basic_auth_users:
+  prometheus: $2y$10$...
+```
+
+Passwords are stored as bcrypt hashes, which can be generated with `htpasswd -nBC 10 "" | tr -d ':\n'`.
+
+Notes:
+
+- `client_auth_type` defaults to `NoClientCert`, so `client_ca_file` has no effect unless `client_auth_type` is set.
+- The server certificate needs the `serverAuth` extended key usage and a SAN matching the name Prometheus scrapes. The client certificate needs `clientAuth`.
+- A client without a valid certificate fails the TLS handshake. A client with a valid certificate but a wrong password gets a `401`.
+
+Matching Prometheus scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: cgroup
+    scheme: https
+    basic_auth:
+      username: prometheus
+      password_file: /etc/prometheus/cgroup_exporter.pass
+    tls_config:
+      ca_file: /etc/prometheus/ca.crt           # verifies the exporter's certificate
+      cert_file: /etc/prometheus/client.crt     # presented to the exporter
+      key_file: /etc/prometheus/client.key
+    static_configs:
+      - targets: ['node1.example.org:9306']
+```
+
 ## Metrics
 
 Example of metrics exposed by this exporter when looking at `/user.slice` paths:
